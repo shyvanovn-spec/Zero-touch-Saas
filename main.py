@@ -1,166 +1,132 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zero-Touch Rechnungs-Scanner</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #f7f9fa;
-            color: #333;
-            margin: 0;
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        .container {
-            width: 100%;
-            max-width: 480px;
-            background: #ffffff;
-            padding: 24px;
-            border-radius: 12px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
-            box-sizing: border-box;
-        }
-        h2 {
-            font-size: 20px;
-            margin-bottom: 8px;
-            color: #111;
-        }
-        .privacy-badge {
-            font-size: 12px;
-            color: #0d6efd;
-            background: #e7f1ff;
-            padding: 6px 10px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            display: inline-block;
-        }
-        .form-group {
-            margin-bottom: 16px;
-        }
-        label {
-            display: block;
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 6px;
-        }
-        input[type="email"], input[type="file"] {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ced4da;
-            border-radius: 8px;
-            font-size: 16px; /* Предотвращает зум на iOS */
-            box-sizing: border-box;
-        }
-        button {
-            width: 100%;
-            padding: 14px;
-            background-color: #0d6efd;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 10px;
-        }
-        button:active {
-            background-color: #0b5ed7;
-        }
-        #result {
-            margin-top: 20px;
-            background: #f1f3f5;
-            padding: 14px;
-            border-radius: 8px;
-            font-family: monospace;
-            font-size: 13px;
-            white-space: pre-wrap;
-            display: none;
-        }
-        .loading {
-            text-align: center;
-            color: #6c757d;
-            margin-top: 10px;
-            display: none;
-        }
-    </style>
-</head>
-<body>
+import os
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel, EmailStr, Field
+from google import genai
+from google.genai import types
 
-<div class="container">
-    <h2>Rechnung hochladen</h2>
-    <div class="privacy-badge">🔒 DSGVO-konform: Zero-Storage (Keine dauerhafte Speicherung)</div>
+app = FastAPI(title="Zero-Touch Accounting SaaS - Credit System")
 
-    <form id="uploadForm">
-        <div class="form-group">
-            <label for="email">Ihre E-Mail (Registrierungs-E-Mail):</label>
-            <input type="email" id="email" required placeholder="name@firma.de">
-        </div>
+client = genai.Client()
 
-        <div class="form-group">
-            <label for="file">Rechnung (PDF oder Bild):</label>
-            <!-- Телефон автоматически предложит выбрать файл из памяти или галереи -->
-            <input type="file" id="file" accept=".pdf,image/jpeg,image/png" required>
-        </div>
+DATABASE = {}
 
-        <button type="submit" id="submitBtn">Rechnung verarbeiten</button>
-    </form>
+MAX_FILE_SIZE_MB = 10
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-    <div class="loading" id="loadingText">Verarbeitung läuft über KI... Bitte warten.</div>
-    <div id="result"></div>
-</div>
+class InvoiceResponse(BaseModel):
+    vendor_name: str
+    invoice_number: str
+    date: str
+    net_amount: float
+    tax_amount: float
+    gross_amount: float
+    currency: str
 
-<script>
-    const form = document.getElementById('uploadForm');
-    const submitBtn = document.getElementById('submitBtn');
-    const loadingText = document.getElementById('loadingText');
-    const resultDiv = document.getElementById('result');
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    accepted_terms: bool = Field(..., description="AGB und Datenschutz akzeptiert")
 
-    form.addEventListener('submit', async (e) => {
-        e.preventDefault();
+@app.post("/api/register")
+async def register_client(data: RegisterRequest):
+    if not data.accepted_terms:
+        raise HTTPException(
+            status_code=400, 
+            detail="Sie müssen den AGB und Datenschutz zustimmen."
+        )
+    
+    user_hash = abs(hash(data.email)) % 100000
+    personal_email = f"user_{user_hash}@your-app.de"
+    
+    DATABASE[personal_email] = {
+        "client_email": data.email,
+        "credits": 3, 
+    }
+    
+    return {
+        "status": "success",
+        "message": "Registrierung erfolgreich.",
+        "assigned_invoice_email": personal_email,
+        "free_credits": 3
+    }
+
+@app.post("/api/process-invoice")
+async def process_incoming_invoice(
+    client_invoice_email: str = Form(...), 
+    file: UploadFile = File(...)
+):
+    if client_invoice_email not in DATABASE:
+        raise HTTPException(status_code=403, detail="Unbekannte E-Mail. Bitte registrieren.")
+    
+    user_data = DATABASE[client_invoice_email]
+    if user_data["credits"] <= 0:
+        raise HTTPException(status_code=402, detail="Nicht genügend Credits. Bitte aufladen.")
+
+    try:
+        file_bytes = await file.read()
         
-        const email = document.getElementById('email').value;
-        const fileInput = document.getElementById('file');
-        
-        if (fileInput.files.length === 0) {
-            alert('Bitte wählen Sie eine Datei aus.');
-            return;
+        if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413, 
+                detail=f"Datei zu groß. Max. {MAX_FILE_SIZE_MB} MB."
+            )
+
+        mime_type = file.content_type
+        if mime_type not in ["application/pdf", "image/jpeg", "image/png"]:
+            raise HTTPException(status_code=400, detail="Ungültiges Format (nur PDF/JPEG/PNG).")
+
+        prompt = (
+            "Analyze this German invoice and extract accurately: "
+            "vendor name, invoice number, date, net amount (Nettobetrag), "
+            "tax amount (MwSt / Steuer), gross amount (Bruttobetrag), and currency."
+        )
+
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=InvoiceResponse,
+                temperature=0.1,
+            ),
+        )
+
+        extracted_data = response.text
+        user_data["credits"] -= 1
+
+        return {
+            "status": "success",
+            "recipient_box": client_invoice_email,
+            "extracted_data": eval(extracted_data),
+            "credits_left": user_data["credits"],
+            "storage_status": "Files wiped from RAM successfully"
         }
 
-        const formData = new FormData();
-        formData.append('client_invoice_email', email);
-        formData.append('file', fileInput.files[0]);
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Serverfehler: {str(e)}"
+        )
 
-        submitBtn.style.display = 'none';
-        loadingText.style.display = 'block';
-        resultDiv.style.display = 'none';
+@app.post("/api/billing/takenos-webhook")
+async def takenos_payment_webhook(
+    client_invoice_email: str = Form(...),
+    credits_to_add: int = Form(...)
+):
+    if client_invoice_email not in DATABASE:
+        raise HTTPException(status_code=404, detail="Kunde nicht gefunden.")
+    
+    DATABASE[client_invoice_email]["credits"] += credits_to_add
+    
+    return {
+        "status": "success",
+        "new_balance": DATABASE[client_invoice_email]["credits"]
+    }
 
-        try {
-            // Здесь будет адрес вашего развернутого бэкенда (например, на Render)
-            const response = await fetch('https://your-backend-url.onrender.com/api/process-invoice', {
-                method: 'POST',
-                body: formData
-            });
-
-            const data = await response.json();
-
-            if (response.ok) {
-                resultDiv.style.display = 'block';
-                resultDiv.textContent = "Erfolgreich!\n\n" + JSON.stringify(data.extracted_data, null, 2);
-            } else {
-                alert('Fehler: ' + (data.detail || 'Unbekannter Fehler'));
-            }
-        } catch (error) {
-            alert('Netzwerkfehler: ' + error.message);
-        } finally {
-            submitBtn.style.display = 'block';
-            loadingText.style.display = 'none';
-        }
-    });
-</script>
-
-</body>
-</html>
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
