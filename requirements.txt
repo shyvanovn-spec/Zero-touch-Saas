@@ -3,4 +3,4 @@ uvicorn
 sqlmodel
 google-genai
 python-multipart
-pydantic
+pydantic[email]
